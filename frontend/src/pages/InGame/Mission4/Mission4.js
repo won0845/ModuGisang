@@ -2,7 +2,6 @@ import React, { useContext, useRef, useEffect, useState } from 'react';
 import { OpenViduContext, GameContext } from '../../../contexts';
 import styled from 'styled-components';
 import { MissionStarting, MissionEnding } from '../components';
-import { calculateDecibels } from './decibelUtils';
 import sunImage from '../../../assets/sun.png';
 import hillImage from '../../../assets/hill.png';
 
@@ -10,9 +9,7 @@ const Mission4 = () => {
   const {
     isMissionStarting,
     isMissionEnding,
-    isMusicMuted,
     myMissionStatus,
-    gameScore,
     setGameScore,
     setIsRoundPassed,
     setMyMissionStatus,
@@ -31,17 +28,13 @@ const Mission4 = () => {
   const [isGameOver, setIsGameOver] = useState(false);
   const TIME_LIMIT = 24; // 통과 제한 시간 (초 단위)
   const [remainingTime, setRemainingTime] = useState(0);
+  const audioContextRef = useRef(null);
+  const audioWorkletNodeRef = useRef(null);
 
   useEffect(() => {
-    if (!myStream) {
-      return;
-    }
-    //const actualStream = myStream.stream.getMediaStream();
+    if (!myStream) return;
     initializeStream();
-
-    return () => {
-      stopAudioStream();
-    };
+    return stopAudioProcessing;
   }, [myStream]);
 
   useEffect(() => {
@@ -67,7 +60,6 @@ const Mission4 = () => {
 
   useEffect(() => {
     if (myMissionStatus && !isGameOver) {
-      // effect(3);
       setRemainingTime(TIME_LIMIT - elapsedTime);
     }
   }, [myMissionStatus]);
@@ -77,100 +69,129 @@ const Mission4 = () => {
   }, [remainingTime]);
 
   useEffect(() => {
-    if (!stream || isMissionStarting || myMissionStatus) return;
-
-    if (elapsedTime > TIME_LIMIT && isGameOver) {
+    if (
+      !stream ||
+      isMissionStarting ||
+      myMissionStatus ||
+      (elapsedTime > TIME_LIMIT && isGameOver)
+    )
       return;
+
+    try {
+      let audioContext = audioContextRef.current;
+      if (!audioContext) {
+        audioContext = new AudioContext();
+        audioContextRef.current = audioContext;
+        setWorklet(audioContext, stream);
+      }
+    } catch (error) {
+      console.error('Error initializing audio processing', error);
     }
-
-    const audioContext = new AudioContext();
-    const source = audioContext.createMediaStreamSource(stream);
-    const analyser = audioContext.createAnalyser();
-    source.connect(analyser);
-    analyser.fftSize = 2048;
-
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-
-    const intervalId = setInterval(() => {
-      const decibels = calculateDecibels(analyser, dataArray, bufferLength);
-      setDecibels(decibels); // 데시벨 상태 업데이트
-
-      if (decibels > 50) {
-        setShoutingDuration(prevDuration => prevDuration + 0.2);
-      }
-      if (shoutingDuration > 5) {
-        clearInterval(intervalId);
-        setMyMissionStatus(true);
-        setIsRoundPassed(true);
-        micSetting(true);
-
-        return;
-      }
-      setSunPosition();
-    }, 200);
-
-    return () => {
-      clearInterval(intervalId);
-      audioContext.close();
-    };
   }, [stream, isMissionStarting, shoutingDuration, isGameOver]);
 
-  // 스트림 정지 및 자원 해제 함수
-  function stopAudioStream() {
-    if (stream) {
-      stream.getTracks().forEach(track => track.stop());
-      setStream(null);
+  useEffect(() => {
+    if (shoutingDuration > 5) {
+      setMyMissionStatus(true);
+      setIsRoundPassed(true);
+      stopAudioProcessing();
+      micSetting(true);
     }
-  }
-  function micSetting(state) {
+  }, [shoutingDuration]);
+
+  const stopAudioProcessing = () => {
+    const audioWorkletNode = audioWorkletNodeRef.current;
+    const audioContext = audioContextRef.current;
+
+    if (audioWorkletNode) {
+      audioWorkletNode.port.postMessage('stop');
+      audioWorkletNode.disconnect();
+    }
+
+    if (audioContext) {
+      audioContext.close();
+      audioContextRef.current = null;
+    }
+  };
+
+  const micSetting = state => {
     myStream.publishAudio(state);
     setMicOn(state);
-  }
+  };
 
-  function updateGameScore(remainingTime) {
-    let scoreToAdd = 0;
-    if (remainingTime >= 10) scoreToAdd = 20;
-    else if (remainingTime >= 8) scoreToAdd = 16;
-    else if (remainingTime >= 6) scoreToAdd = 12;
-    else if (remainingTime >= 4) scoreToAdd = 8;
-    else if (remainingTime >= 2) scoreToAdd = 4;
+  const setWorklet = async (audioContext, audioStream) => {
+    await audioContext.audioWorklet.addModule('/decibel-processor.js');
 
+    const audioWorkletNode = new AudioWorkletNode(
+      audioContext,
+      'decibel-processor',
+    );
+    audioWorkletNodeRef.current = audioWorkletNode;
+
+    audioWorkletNode.port.onmessage = event => {
+      let { decibels } = event.data;
+      setDecibels(decibels);
+      console.log('현재 데시벨입니다.', decibels);
+
+      if (decibels > 70) {
+        setShoutingDuration(prevDuration => {
+          const newDuration = prevDuration + 0.2;
+          setSunPosition(newDuration);
+          return newDuration;
+        });
+      }
+    };
+
+    const source = audioContext.createMediaStreamSource(audioStream);
+    source.connect(audioWorkletNode);
+  };
+
+  const updateGameScore = remainingTime => {
+    const scoreToAdd =
+      remainingTime >= 10
+        ? 20
+        : remainingTime >= 8
+          ? 16
+          : remainingTime >= 6
+            ? 12
+            : remainingTime >= 4
+              ? 8
+              : remainingTime >= 2
+                ? 4
+                : 0;
     setGameScore(prevScore => prevScore + scoreToAdd);
-  }
+    console.log('현재 점수입니다.', scoreToAdd);
+  };
 
-  function setSunPosition() {
-    const screenHeight = window.innerHeight; // 화면 높이
-    const minPercentage = 10; // 해가 화면 상단에 위치하는 최소 퍼센트 값
+  const setSunPosition = shoutingDuration => {
+    const screenHeight = window.innerHeight;
+    const minPercentage = 10;
     const percentage = Math.max(
       ((shoutingDuration * 120) / screenHeight) * 150,
       minPercentage,
     );
-
-    // 퍼센트를 높이로 변환하여 위치 설정
     const newSunPositionY = screenHeight * (1 - percentage / 100);
     setSunPositionY(newSunPositionY);
-  }
+  };
 
-  async function getAudioStream() {
+  const getAudioStream = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const audioStream = await navigator.mediaDevices.getUserMedia({
         audio: true,
         video: false,
       });
-      return stream;
+      return audioStream;
     } catch (error) {
       console.error('Error accessing audio stream', error);
     }
-  }
+  };
 
-  async function initializeStream() {
+  const initializeStream = async () => {
     const audioStream = await getAudioStream();
     if (audioStream) {
       setStream(audioStream);
       micSetting(false);
     }
-  }
+  };
   return (
     <>
       <MissionStarting />
@@ -232,7 +253,7 @@ const Canvas = styled.canvas`
   bottom: 0;
   left: 0;
 
-  width: 60%;
+  width: 70%;
   height: 100%;
 
   border-right: 4px solid ${({ theme }) => theme.colors.system.red};
